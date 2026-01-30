@@ -1,0 +1,38 @@
+# Dependencies
+node_modules/
+
+# Expo & Metro
+.expo/
+.cache/
+
+# TypeScript
+*.tsbuildinfo
+
+# Logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Build outputs
+dist/
+build/
+.next/
+
+# Expo web export
+web-build/
+
+# Android
+android/.gradle/
+android/app/build/
+
+# iOS
+ios/Pods/
+ios/build/
+
+# Env
+.env
+.env.*
