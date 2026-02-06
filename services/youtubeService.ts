@@ -2,11 +2,11 @@ import { Track } from '../types';
 import { searchMusic as fallbackSearch } from './musicService';
 
 const INSTANCES = [
-  'https://pipedapi.kavin.rocks',
-  'https://pipedapi.leptons.xyz',
+  'https://api.piped.privacydev.net',
   'https://pipedapi.drgns.space', 
   'https://pipedapi.ducks.party',
-  'https://api.piped.privacydev.net'
+  'https://pipedapi.leptons.xyz',
+  'https://pipedapi.kavin.rocks'
 ];
 
 const INVIDIOUS = [
@@ -17,19 +17,16 @@ const INVIDIOUS = [
 ];
 
 // Helper for requests with timeout
-async function fetchWithTimeout(url: string, timeout = 8000) {
-  // Use a race because AbortController might not be fully supported in all RN environments/versions
-  // or simple race is more robust for "first success" logic later.
+async function fetchJson(url: string, timeout = 5000) {
+  // Use Promise.race to enforce timeout
   return Promise.race([
-    fetchJson(url),
+    (async () => {
+      const res = await fetch(url);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      return res.json();
+    })(),
     new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout')), timeout))
   ]);
-}
-
-async function fetchJson(url: string) {
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  return res.json();
 }
 
 // Helper to get the first successful promise from a list
@@ -46,7 +43,7 @@ async function raceSuccess<T>(promises: Promise<T>[]): Promise<T> {
 
 async function tryFetchJson(urls: string[]): Promise<any> {
   // Race them all
-  const promises = urls.map(u => fetchWithTimeout(u));
+  const promises = urls.map(u => fetchJson(u));
   return await raceSuccess(promises);
 }
 
@@ -79,7 +76,13 @@ function isValidUrl(u: string | undefined | null): boolean {
 
 async function resolveAudioUrl(instance: string, videoId: string): Promise<string | null> {
   // Add specific timeout for stream resolution
-  const data = await fetchWithTimeout(`${instance}/streams/${encodeURIComponent(videoId)}`, 8000);
+  const data = await fetchJson(`${instance}/streams/${encodeURIComponent(videoId)}`, 8000);
+  
+  // 1. Try HLS first (Expo AV loves HLS)
+  if (data?.hls && isValidUrl(data.hls)) {
+    return data.hls;
+  }
+
   const streams = data?.audioStreams || [];
   const preferred = streams.filter((s: any) => {
     const c = (s.container || '').toLowerCase();
@@ -87,7 +90,20 @@ async function resolveAudioUrl(instance: string, videoId: string): Promise<strin
   });
   const list = preferred.length ? preferred : streams;
   const best = list.sort((a: any, b: any) => (b.bitrate || 0) - (a.bitrate || 0))[0];
-  const u = best?.url || best?.proxyUrl || null;
+  
+  // Prefer proxyUrl if available to avoid 403s from direct googlevideo links
+  // But some instances only provide 'url'. 
+  // We check if 'url' is a googlevideo link, if so we definitely need a proxy.
+  let finalUrl = best?.url;
+  if (finalUrl && finalUrl.includes('googlevideo.com')) {
+     finalUrl = best?.proxyUrl || finalUrl; // Fallback to url if proxyUrl missing (will likely fail but worth a shot)
+  } else {
+     // If not googlevideo, it might be already proxied or a different provider.
+     // We still prefer proxyUrl if it exists as it's safer.
+     finalUrl = best?.proxyUrl || best?.url;
+  }
+  
+  const u = finalUrl || null;
   return isValidUrl(u) ? (u as string) : null;
 }
 
@@ -167,29 +183,41 @@ async function fetchPlaylistVideosAcrossInstances(playlistId: string): Promise<a
 }
 
 async function fetchInvidiousChannelVideos(channelId: string): Promise<any[]> {
-  for (const base of INVIDIOUS) {
+  const calls = INVIDIOUS.map(async (base) => {
     try {
       const data = await fetchJson(`${base}/channels/${encodeURIComponent(channelId)}`);
       const vids = Array.isArray(data?.latestVideos) ? data.latestVideos : [];
-      return vids;
+      if (vids.length) return vids;
+      throw new Error('Empty');
     } catch {
-      continue;
+      throw new Error('Failed');
     }
+  });
+
+  try {
+    return await Promise.any(calls);
+  } catch {
+    return [];
   }
-  return [];
 }
 
 async function searchInvidiousChannels(query: string): Promise<any[]> {
-  for (const base of INVIDIOUS) {
+  const calls = INVIDIOUS.map(async (base) => {
     try {
       const data = await fetchJson(`${base}/search?q=${encodeURIComponent(query)}&type=channel`);
       const items = Array.isArray(data) ? data : [];
       if (items.length) return items;
+      throw new Error('Empty');
     } catch {
-      continue;
+      throw new Error('Failed');
     }
+  });
+
+  try {
+    return await Promise.any(calls);
+  } catch {
+    return [];
   }
-  return [];
 }
 async function pipedSearch(instance: string, q: string): Promise<any[]> {
   const primary = `${instance}/search?q=${encodeURIComponent(q)}`;
@@ -284,19 +312,24 @@ function mapInvidiousItemToTrack(item: any): Track | null {
 }
 
 async function searchInvidious(query: string): Promise<Track[]> {
-  for (const base of INVIDIOUS) {
+  const calls = INVIDIOUS.map(async (base) => {
     try {
       const data = await fetchJson(`${base}/search?q=${encodeURIComponent(query)}&type=video`);
       const items = Array.isArray(data) ? data : [];
       const videos = items.filter((i: any) => (i.type || 'video') === 'video');
-      if (!videos.length) continue;
-      const mapped = videos.slice(0, 25).map(mapInvidiousItemToTrack).filter(Boolean) as Track[];
-      return mapped;
+      if (videos.length) return videos;
+      throw new Error('Empty');
     } catch {
-      continue;
+      throw new Error('Failed');
     }
+  });
+
+  try {
+    const firstBatch = await Promise.any(calls);
+    return firstBatch.slice(0, 25).map(mapInvidiousItemToTrack).filter(Boolean) as Track[];
+  } catch {
+    return [];
   }
-  return [];
 }
 
 async function searchITunes(query: string): Promise<Track[]> {
@@ -327,19 +360,7 @@ export const searchYouTubeMusic = async (query: string): Promise<Track[]> => {
   const q = query.trim();
   if (!q) return [];
 
-  let instance = first(INSTANCES) as string;
-  for (const base of INSTANCES) {
-    try {
-      await fetchJson(`${base}/status`);
-      instance = base;
-      break;
-    } catch {
-      continue;
-    }
-  }
-
-  let results: any = [];
-  try {
+  const searchPiped = async (): Promise<Track[]> => {
     const items = await pipedSearchAcrossInstances(q);
     const typeOf = (i: any) => String(i.type || 'stream').toLowerCase();
     const streams = items.filter((i: any) => {
@@ -349,6 +370,7 @@ export const searchYouTubeMusic = async (query: string): Promise<Track[]> => {
     const channels = items.filter((i: any) => typeOf(i) === 'channel');
     const playlists = items.filter((i: any) => typeOf(i) === 'playlist');
 
+    let results: any[] = [];
     if (streams.length) {
       results = streams.slice(0, 25);
     } else if (playlists.length) {
@@ -371,25 +393,30 @@ export const searchYouTubeMusic = async (query: string): Promise<Track[]> => {
         if (cid) chVideos = await fetchInvidiousChannelVideos(cid);
       }
       results = chVideos.slice(0, 25);
-    } else {
-      results = [];
     }
+
+    const mapped = results
+      .map((item: any) => mapItemToTrack(INSTANCES[0], item))
+      .filter(Boolean) as Track[];
+    
+    if (mapped.length) return mapped;
+    throw new Error('Empty Piped');
+  };
+
+  const searchInv = async (): Promise<Track[]> => {
+    const inv = await searchInvidious(q);
+    if (inv.length) return inv;
+    throw new Error('Empty Invidious');
+  };
+
+  try {
+    return await Promise.any([searchPiped(), searchInv()]);
   } catch {
-    results = [];
+    // Both failed, try iTunes
+    const apple = await searchITunes(q);
+    if (apple.length) return apple;
+    return await fallbackSearch(q);
   }
-
-  const mapped = results
-    .map((item: any) => mapItemToTrack(instance, item))
-    .filter(Boolean) as Track[];
-  if (mapped.length) return mapped;
-
-  const inv = await searchInvidious(q);
-  if (inv.length) return inv;
-
-  const apple = await searchITunes(q);
-  if (apple.length) return apple;
-
-  return await fallbackSearch(q);
 };
 
 export const getSuggestions = async (query: string): Promise<string[]> => {
@@ -407,8 +434,7 @@ export const getSuggestions = async (query: string): Promise<string[]> => {
     });
   } catch {}
   try {
-    const instance = first(INSTANCES) as string;
-    const data = await pipedSearch(instance, q);
+    const data = await pipedSearchAcrossInstances(q);
     const channels = data.filter((i: any) => (i.type || '').toLowerCase() === 'channel');
     const playlists = data.filter((i: any) => (i.type || '').toLowerCase() === 'playlist');
     const videos = data.filter((i: any) => (i.type || 'video') === 'video');

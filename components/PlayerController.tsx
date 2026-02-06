@@ -26,26 +26,50 @@ export function PlayerController() {
 
   // Handle Track Change
   useEffect(() => {
+    let isMounted = true;
+    
     async function loadSound() {
       if (!currentTrack || !currentTrack.url) return;
 
-      // Unload previous sound
-      if (soundRef.current) {
-        await soundRef.current.unloadAsync();
+      try {
+        // Unload previous sound
+        if (soundRef.current) {
+          try {
+            await soundRef.current.unloadAsync();
+          } catch (e) {
+            console.warn('Failed to unload previous sound', e);
+          }
+        }
+
+        const loadPromise = Audio.Sound.createAsync(
+          { uri: currentTrack.url },
+          { shouldPlay: isPlaying },
+          onPlaybackStatusUpdate
+        );
+        
+        const timeoutPromise = new Promise((_, reject) => 
+          setTimeout(() => reject(new Error('Load timeout')), 15000)
+        );
+
+        const result: any = await Promise.race([loadPromise, timeoutPromise]);
+        const { sound } = result;
+
+        if (isMounted) {
+          soundRef.current = sound;
+        } else {
+          sound.unloadAsync();
+        }
+      } catch (e) {
+        console.error('Failed to load sound', e);
+        // If loading fails, we might want to try next track or just stop
+        if (isMounted) setIsPlaying(false);
       }
-
-      const { sound } = await Audio.Sound.createAsync(
-        { uri: currentTrack.url },
-        { shouldPlay: isPlaying },
-        onPlaybackStatusUpdate
-      );
-
-      soundRef.current = sound;
     }
 
     loadSound();
 
     return () => {
+      isMounted = false;
       if (soundRef.current) {
         soundRef.current.unloadAsync();
       }
