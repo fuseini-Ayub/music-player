@@ -4,20 +4,16 @@ import { searchMusic as fallbackSearch } from './musicService';
 const INSTANCES = [
   'https://pipedapi.kavin.rocks',
   'https://pipedapi.leptons.xyz',
-  'https://pipedapi.nosebs.ru',
-  'https://pipedapi-libre.kavin.rocks',
-  'https://piped.video',
-  'https://piped.us.projectsegfau.lt',
-  'https://piped.mha.fi',
-  'https://piped.projectsegfau.lt'
+  'https://pipedapi.drgns.space', 
+  'https://pipedapi.ducks.party',
+  'https://api.piped.privacydev.net'
 ];
 
 const INVIDIOUS = [
   'https://inv.tux.pizza/api/v1',
-  'https://yewtu.be/api/v1',
   'https://inv.nadeko.net/api/v1',
-  'https://invidious.tiekoetter.com/api/v1',
-  'https://invidious.drgns.space/api/v1'
+  'https://invidious.drgns.space/api/v1',
+  'https://invidious.privacydev.net/api/v1'
 ];
 
 // Helper for requests with timeout

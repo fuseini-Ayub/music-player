@@ -152,6 +152,15 @@ export const usePlayerStore = create<PlayerState>((set, get) => ({
     const resolveIfNeeded = async (t: Track) => {
        const isPreview = t.duration === 30 || (t.url && t.url.includes('apple.com'));
        if ((!t.url || isPreview) && !t.isOffline) {
+          // 1. Try direct ID resolution first if it looks like a YouTube ID
+          if (t.id && t.id.length === 11) {
+             const url = await getAudioUrl(t.id);
+             if (url) {
+                return { ...t, url, duration: t.duration, id: t.id };
+             }
+          }
+          
+          // 2. Fallback to search
           const query = `${t.artist} - ${t.title}`;
           const match = await findBestStreamMatch(query);
           if (match) {
@@ -184,43 +193,45 @@ export const usePlayerStore = create<PlayerState>((set, get) => ({
     let trackToPlay = offlineTrack || track;
 
     // Check if we need to resolve the URL.
-    // Conditions:
-    // 1. No URL
-    // 2. URL is a short preview (iTunes is ~30s)
-    // 3. URL is an iTunes preview URL
     const isPreview = trackToPlay.duration === 30 || (trackToPlay.url && trackToPlay.url.includes('apple.com'));
     const needsResolution = !trackToPlay.url || isPreview;
 
     if (needsResolution && !trackToPlay.isOffline) {
-      // Try to find a streamable version via YouTube
-      const query = `${trackToPlay.artist} - ${trackToPlay.title}`;
-      console.log(`Resolving stream for: ${query}`);
-      
-      const resolvedTrack = await findBestStreamMatch(query);
-      
-      if (resolvedTrack) {
-        const audioUrl = await getAudioUrl(resolvedTrack.id);
-        if (audioUrl) {
-           // Use the resolved metadata + new URL
-           trackToPlay = { 
-             ...trackToPlay, // keep original metadata if preferred
-             url: audioUrl,
-             duration: resolvedTrack.duration || trackToPlay.duration // update duration if possible
-           };
-        } else {
-           console.warn('Found match but failed to resolve URL');
-        }
+      console.log(`Needs resolution for: ${trackToPlay.title}`);
+      let resolvedUrl: string | null = null;
+      let newDuration = trackToPlay.duration;
+
+      // 1. If ID looks like a YouTube ID (11 chars), try direct resolution first
+      if (trackToPlay.id && trackToPlay.id.length === 11) {
+         console.log(`Trying direct resolution for ID: ${trackToPlay.id}`);
+         resolvedUrl = await getAudioUrl(trackToPlay.id);
+      }
+
+      // 2. If direct resolution failed, OR if it's not a YouTube ID, search by name
+      if (!resolvedUrl) {
+         const query = `${trackToPlay.artist} - ${trackToPlay.title}`;
+         console.log(`Resolving stream via search for: ${query}`);
+         const match = await findBestStreamMatch(query);
+         if (match) {
+            resolvedUrl = await getAudioUrl(match.id);
+            if (resolvedUrl) {
+               newDuration = match.duration || trackToPlay.duration;
+            }
+         }
+      }
+
+      if (resolvedUrl) {
+         trackToPlay = { 
+           ...trackToPlay, 
+           url: resolvedUrl,
+           duration: newDuration
+         };
       } else {
-        console.warn('No streamable match found');
+         console.warn('Failed to resolve URL');
       }
     }
 
-    set({ 
-      currentTrack: trackToPlay, 
-      isPlaying: true,
-      queue: [trackToPlay],
-      queueIndex: 0
-    });
+    set({ currentTrack: trackToPlay, isPlaying: true });
   },
 
   togglePlay: () => set((state) => ({ isPlaying: !state.isPlaying })),
@@ -238,7 +249,12 @@ export const usePlayerStore = create<PlayerState>((set, get) => ({
       });
       if (next && !next.url) {
         (async () => {
-          let url = await getAudioUrl(next.id);
+          let url = null;
+          // 1. Try ID if it looks like YouTube ID
+          if (next.id && next.id.length === 11) {
+             url = await getAudioUrl(next.id);
+          }
+          
           if (!url) {
             const q = `${next.artist} ${next.title}`;
             const candidates = await searchYouTubeMusic(q);
