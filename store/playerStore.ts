@@ -2,7 +2,7 @@ import { create } from 'zustand';
 import { Track } from '../types';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as FileSystem from 'expo-file-system';
-import { getAudioUrl, searchYouTubeMusic } from '../services/youtubeService';
+import { getAudioUrl, searchYouTubeMusic, findBestStreamMatch } from '../services/youtubeService';
 
 interface PlayerState {
   currentTrack: Track | null;
@@ -67,6 +67,27 @@ export const usePlayerStore = create<PlayerState>((set, get) => ({
   saveToLibrary: async (track) => {
     try {
       await ensureDirExists();
+      
+      let urlToDownload = track.url;
+      let durationToSave = track.duration;
+
+      // Check if we need to resolve the URL before downloading
+      const isPreview = track.duration === 30 || (track.url && track.url.includes('apple.com'));
+      if (!urlToDownload || isPreview) {
+          console.log(`Resolving URL for download: ${track.title}`);
+          const query = `${track.artist} - ${track.title}`;
+          const match = await findBestStreamMatch(query);
+          if (match) {
+             const resolvedUrl = await getAudioUrl(match.id);
+             if (resolvedUrl) {
+                 urlToDownload = resolvedUrl;
+                 durationToSave = match.duration || track.duration;
+             }
+          }
+      }
+
+      if (!urlToDownload) throw new Error("Could not resolve URL for download");
+
       // Sanitize ID to be safe for filenames
       const safeId = track.id.replace(/[^a-z0-9]/gi, '_');
       const filename = `${safeId}.mp3`;
@@ -74,11 +95,7 @@ export const usePlayerStore = create<PlayerState>((set, get) => ({
       
       console.log(`Starting download for ${track.title} to ${fileUri}`);
       
-      // If we were really downloading from YouTube, we'd need a direct link.
-      // Since our mock URLs are direct MP3s, we can download them.
-      // In a real YT scenario, this step requires getting the stream URL first.
-      
-      const downloadRes = await FileSystem.downloadAsync(track.url, fileUri);
+      const downloadRes = await FileSystem.downloadAsync(urlToDownload, fileUri);
       
       console.log('Download finished', downloadRes);
 
@@ -86,7 +103,7 @@ export const usePlayerStore = create<PlayerState>((set, get) => ({
         throw new Error(`Download failed with status ${downloadRes.status}`);
       }
 
-      const newTrack = { ...track, url: fileUri, isOffline: true };
+      const newTrack = { ...track, url: fileUri, isOffline: true, duration: durationToSave };
       const { library } = get();
       
       // Avoid duplicates
@@ -130,66 +147,72 @@ export const usePlayerStore = create<PlayerState>((set, get) => ({
       currentTrack: start,
       isPlaying: true 
     });
-    if (start && !start.url) {
+    
+    // Helper to resolve track if needed
+    const resolveIfNeeded = async (t: Track) => {
+       const isPreview = t.duration === 30 || (t.url && t.url.includes('apple.com'));
+       if ((!t.url || isPreview) && !t.isOffline) {
+          const query = `${t.artist} - ${t.title}`;
+          const match = await findBestStreamMatch(query);
+          if (match) {
+             const url = await getAudioUrl(match.id);
+             if (url) {
+                return { ...t, url, duration: match.duration || t.duration, id: match.id };
+             }
+          }
+       }
+       return null;
+    };
+
+    if (start) {
       (async () => {
-        let url = await getAudioUrl(start.id);
-        if (!url) {
-          const q = `${start.artist} ${start.title}`;
-          const candidates = await searchYouTubeMusic(q);
-          const best = candidates[0];
-          if (best) {
-            url = await getAudioUrl(best.id);
-            if (url) {
-              const { currentTrack } = get();
-              if (currentTrack?.id === start.id) {
-                set({ currentTrack: { ...start, id: best.id, artwork: start.artwork || best.artwork, url } });
-              }
-              return;
-            }
-          }
-        }
-        if (url) {
-          const { currentTrack } = get();
-          if (currentTrack?.id === start.id) {
-            set({ currentTrack: { ...start, url } });
-          }
+        const resolved = await resolveIfNeeded(start);
+        if (resolved) {
+           const { currentTrack } = get();
+           // Only update if the current track hasn't changed
+           if (currentTrack?.title === start.title) {
+              set({ currentTrack: resolved });
+           }
         }
       })();
     }
   },
 
-  playTrack: (track) => {
-    // Check if we have an offline version
+  playTrack: async (track) => {
     const { library } = get();
     const offlineTrack = library.find(t => t.id === track.id);
     let trackToPlay = offlineTrack || track;
-    // Resolve streaming URL lazily for faster search results
-    if (!trackToPlay.url && !offlineTrack) {
-      // Fire-and-forget resolution; update currentTrack when resolved
-      (async () => {
-        let url = await getAudioUrl(track.id);
-        if (!url) {
-          const q = `${track.artist} ${track.title}`;
-          const candidates = await searchYouTubeMusic(q);
-          const best = candidates[0];
-          if (best) {
-            url = await getAudioUrl(best.id);
-            if (url) {
-              const { currentTrack } = get();
-              if (currentTrack?.id === track.id) {
-                set({ currentTrack: { ...track, id: best.id, artwork: track.artwork || best.artwork, url } });
-              }
-              return;
-            }
-          }
+
+    // Check if we need to resolve the URL.
+    // Conditions:
+    // 1. No URL
+    // 2. URL is a short preview (iTunes is ~30s)
+    // 3. URL is an iTunes preview URL
+    const isPreview = trackToPlay.duration === 30 || (trackToPlay.url && trackToPlay.url.includes('apple.com'));
+    const needsResolution = !trackToPlay.url || isPreview;
+
+    if (needsResolution && !trackToPlay.isOffline) {
+      // Try to find a streamable version via YouTube
+      const query = `${trackToPlay.artist} - ${trackToPlay.title}`;
+      console.log(`Resolving stream for: ${query}`);
+      
+      const resolvedTrack = await findBestStreamMatch(query);
+      
+      if (resolvedTrack) {
+        const audioUrl = await getAudioUrl(resolvedTrack.id);
+        if (audioUrl) {
+           // Use the resolved metadata + new URL
+           trackToPlay = { 
+             ...trackToPlay, // keep original metadata if preferred
+             url: audioUrl,
+             duration: resolvedTrack.duration || trackToPlay.duration // update duration if possible
+           };
+        } else {
+           console.warn('Found match but failed to resolve URL');
         }
-        if (url) {
-          const { currentTrack } = get();
-          if (currentTrack?.id === track.id) {
-            set({ currentTrack: { ...track, url } });
-          }
-        }
-      })();
+      } else {
+        console.warn('No streamable match found');
+      }
     }
 
     set({ 

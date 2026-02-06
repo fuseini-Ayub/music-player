@@ -3,6 +3,9 @@ import { searchMusic as fallbackSearch } from './musicService';
 
 const INSTANCES = [
   'https://pipedapi.kavin.rocks',
+  'https://pipedapi.leptons.xyz',
+  'https://pipedapi.nosebs.ru',
+  'https://pipedapi-libre.kavin.rocks',
   'https://piped.video',
   'https://piped.us.projectsegfau.lt',
   'https://piped.mha.fi',
@@ -10,9 +13,11 @@ const INSTANCES = [
 ];
 
 const INVIDIOUS = [
+  'https://inv.tux.pizza/api/v1',
   'https://yewtu.be/api/v1',
   'https://inv.nadeko.net/api/v1',
-  'https://invidious.tiekoetter.com/api/v1'
+  'https://invidious.tiekoetter.com/api/v1',
+  'https://invidious.drgns.space/api/v1'
 ];
 
 async function fetchJson(url: string) {
@@ -255,12 +260,15 @@ async function searchITunes(query: string): Promise<Track[]> {
       const title = it.trackName;
       const artist = it.artistName;
       const artwork = (it.artworkUrl100 || '').replace('100x100bb.jpg', '600x600bb.jpg');
-      const url = it.previewUrl || '';
+      // We do not use previewUrl because it is only 30 seconds.
+      // We leave it empty so the player knows to resolve the full stream via YouTube.
+      const url = ''; 
       const duration = Math.round((it.trackTimeMillis || 0) / 1000);
       const album = it.collectionName;
       const t: Track = { id, title, artist, artwork, url, duration, album };
       return t;
-    }).filter((t: Track) => !!t.url);
+    }).filter((t: Track) => !!t.title); // Keep if title exists
+    return mapped;
     return mapped;
   } catch {
     return [];
@@ -365,4 +373,29 @@ export const getSuggestions = async (query: string): Promise<string[]> => {
 
 export const getAudioUrl = async (videoId: string): Promise<string | null> => {
   return await resolveAudioUrlAcrossInstances(videoId);
+};
+
+export const findBestStreamMatch = async (query: string): Promise<Track | null> => {
+  const q = query.trim();
+  if (!q) return null;
+
+  // Try Piped first (best for streams)
+  const pipedItems = await pipedSearchAcrossInstances(q);
+  const pipedStream = pipedItems.find(i => {
+    const t = (i.type || 'stream').toLowerCase();
+    return t === 'stream' || t === 'video';
+  });
+  if (pipedStream) {
+    // Need to map it to a Track so we have the ID
+    // We can pick an arbitrary instance for the map function since ID is what matters
+    return mapItemToTrack(INSTANCES[0], pipedStream);
+  }
+
+  // Try Invidious
+  const invItems = await searchInvidious(q);
+  if (invItems.length > 0) {
+    return invItems[0];
+  }
+
+  return null;
 };
