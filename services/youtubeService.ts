@@ -20,22 +20,40 @@ const INVIDIOUS = [
   'https://invidious.drgns.space/api/v1'
 ];
 
+// Helper for requests with timeout
+async function fetchWithTimeout(url: string, timeout = 8000) {
+  // Use a race because AbortController might not be fully supported in all RN environments/versions
+  // or simple race is more robust for "first success" logic later.
+  return Promise.race([
+    fetchJson(url),
+    new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout')), timeout))
+  ]);
+}
+
 async function fetchJson(url: string) {
   const res = await fetch(url);
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   return res.json();
 }
 
-async function tryFetchJson(urls: string[]): Promise<any> {
-  for (const url of urls) {
-    try {
-      return await fetchJson(url);
-    } catch {
-      continue;
-    }
+// Helper to get the first successful promise from a list
+async function raceSuccess<T>(promises: Promise<T>[]): Promise<T> {
+  // We want the first *resolved* promise.
+  // Promise.any works for this (ES2021). If not available, we need a polyfill.
+  // React Native with Hermes enables ES2021 features.
+  try {
+    return await Promise.any(promises);
+  } catch (e) {
+    throw new Error('All promises failed');
   }
-  throw new Error('All endpoints failed');
 }
+
+async function tryFetchJson(urls: string[]): Promise<any> {
+  // Race them all
+  const promises = urls.map(u => fetchWithTimeout(u));
+  return await raceSuccess(promises);
+}
+
 
 function first<T>(arr: T[]): T | null {
   return Array.isArray(arr) && arr.length > 0 ? arr[0] : null;
@@ -64,7 +82,8 @@ function isValidUrl(u: string | undefined | null): boolean {
 }
 
 async function resolveAudioUrl(instance: string, videoId: string): Promise<string | null> {
-  const data = await fetchJson(`${instance}/streams/${encodeURIComponent(videoId)}`);
+  // Add specific timeout for stream resolution
+  const data = await fetchWithTimeout(`${instance}/streams/${encodeURIComponent(videoId)}`, 8000);
   const streams = data?.audioStreams || [];
   const preferred = streams.filter((s: any) => {
     const c = (s.container || '').toLowerCase();
@@ -80,13 +99,18 @@ async function resolveAudioUrlAcrossInstances(videoId: string): Promise<string |
   const attempts = INSTANCES.map(async (base) => {
     try {
       const url = await resolveAudioUrl(base, videoId);
-      return isValidUrl(url) ? (url as string) : null;
+      if (isValidUrl(url)) return url as string;
+      throw new Error('Invalid URL');
     } catch {
-      return null;
+      throw new Error('Failed');
     }
   });
-  const results = await Promise.all(attempts);
-  return results.find((u) => !!u) || null;
+  
+  try {
+    return await Promise.any(attempts);
+  } catch {
+    return null;
+  }
 }
 
 async function fetchChannelVideos(instance: string, channelId: string): Promise<any[]> {
@@ -109,25 +133,41 @@ async function fetchPlaylistVideos(instance: string, playlistId: string): Promis
 }
 
 async function fetchChannelVideosAcrossInstances(channelId: string): Promise<any[]> {
-  const calls = INSTANCES.map((base) => fetchChannelVideos(base, channelId));
-  const settled = await Promise.allSettled(calls);
-  for (const r of settled) {
-    if (r.status === 'fulfilled' && Array.isArray(r.value) && r.value.length) {
-      return r.value.slice(0, 25);
+  const calls = INSTANCES.map(async (base) => {
+    try {
+      const vids = await fetchChannelVideos(base, channelId);
+      if (vids.length) return vids;
+      throw new Error('Empty');
+    } catch {
+      throw new Error('Failed');
     }
+  });
+  
+  try {
+    const res = await Promise.any(calls);
+    return res.slice(0, 25);
+  } catch {
+    return [];
   }
-  return [];
 }
 
 async function fetchPlaylistVideosAcrossInstances(playlistId: string): Promise<any[]> {
-  const calls = INSTANCES.map((base) => fetchPlaylistVideos(base, playlistId));
-  const settled = await Promise.allSettled(calls);
-  for (const r of settled) {
-    if (r.status === 'fulfilled' && Array.isArray(r.value) && r.value.length) {
-      return r.value.slice(0, 25);
+  const calls = INSTANCES.map(async (base) => {
+    try {
+      const vids = await fetchPlaylistVideos(base, playlistId);
+      if (vids.length) return vids;
+      throw new Error('Empty');
+    } catch {
+      throw new Error('Failed');
     }
+  });
+
+  try {
+    const res = await Promise.any(calls);
+    return res.slice(0, 25);
+  } catch {
+    return [];
   }
-  return [];
 }
 
 async function fetchInvidiousChannelVideos(channelId: string): Promise<any[]> {
@@ -178,24 +218,36 @@ async function pipedSearch(instance: string, q: string): Promise<any[]> {
 }
 
 async function pipedSearchAcrossInstances(q: string): Promise<any[]> {
-  const calls = INSTANCES.map((base) => pipedSearch(base, q));
-  const settled = await Promise.allSettled(calls);
-  const all: any[] = [];
-  for (const r of settled) {
-    if (r.status === 'fulfilled' && Array.isArray(r.value) && r.value.length) {
-      all.push(...r.value);
+  const calls = INSTANCES.map(async (base) => {
+    try {
+      const items = await pipedSearch(base, q);
+      if (items.length) return items;
+      throw new Error('Empty');
+    } catch {
+      throw new Error('Failed');
     }
-  }
-  const seen = new Set<string>();
-  const dedup = all.filter((i: any) => {
-    const id = i.id || i.videoId || i.url || i.title;
-    if (!id) return true;
-    const key = String(id);
-    if (seen.has(key)) return false;
-    seen.add(key);
-    return true;
   });
-  return dedup;
+
+  try {
+    // Return first successful result
+    const firstBatch = await Promise.any(calls);
+    
+    // We still want to deduplicate if possible, but for speed, we take the first batch.
+    // To be safer and get MORE results, we could race for "first 3 successes" but that's complex.
+    // Speed is priority now.
+    const seen = new Set<string>();
+    const dedup = firstBatch.filter((i: any) => {
+      const id = i.id || i.videoId || i.url || i.title;
+      if (!id) return true;
+      const key = String(id);
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+    return dedup;
+  } catch {
+    return [];
+  }
 }
 
 function mapItemToTrack(instance: string, item: any): Track | null {
